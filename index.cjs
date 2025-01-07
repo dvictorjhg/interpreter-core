@@ -921,22 +921,33 @@ async function for_of(values, obj) {
   const res = [];
   try {
     for (const value of values) {
-      const newObjRaw = await interpreter.interpret(obj, value);
-      const newObj = JSON.parse(newObjRaw, (k, v) => {
-        if (
-          typeof v === 'string' &&
-          ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']')))
-        ) {
+      const newObjRaw = await interpreter.interpret(obj, value, { source: 'for_of' });
+      const newObjParsed = (obj => {
+        if (typeof obj === 'object') {
+          return obj;
+        } else {
           try {
-            return JSON.parse(v);
+            return JSON.parse(obj, (k, v) => {
+              if (
+                typeof v === 'string' &&
+                ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']')))
+              ) {
+                try {
+                  return JSON.parse(v);
+                } catch (e) {
+                  return v;
+                }
+              }
+              return v;
+            });
           } catch (e) {
-            return v;
+            return obj;
           }
         }
-        return v;
-      });
-      res.push(newObj);
+      })(newObjRaw);
+      res.push(newObjParsed);
     }
+
     return res;
   } catch (ex) {
     throw new Error(`For of exception: ${ex}`);
@@ -963,19 +974,49 @@ async function interpret(input, values = {}) {
  */
 function lex(input) {
   const isParenthesisOperator = c => /[\(\)]/.test(c);
-  const isCommaOperator = c => c === ',' && !(/['"]/.test(input[i - 1]) && /['"]/.test(input[i + 1]));
+  const isCommaOperator = c => c === ',';
   const isOperator = c => isParenthesisOperator(c) || isCommaOperator(c);
   const isDigit = c => /\d/.test(c);
-  const isWhiteSpace = c => /\s/.test(c); // Includes spaces, tabs, newlines, etc.
+  const isWhiteSpace = c => /\s/.test(c);
   const isIdentifier = c => c === functFlag;
   const isFunction = c => typeof c === 'string' && c.startsWith(functFlag) && functions[c.toLowerCase().substring(1)];
-  const isString = c => typeof c === 'string' && !isOperator(c) && !isDigit(c) && !isWhiteSpace(c) && !isIdentifier(c);
+  const isString = c =>
+    typeof c === 'string' &&
+    !isWhiteSpace(c) &&
+    !isIdentifier(c) &&
+    !isTemplateStart(c) &&
+    (functionDepth > 0 ? !isOperator(c) : true);
+  const isScape = c => c === '/';
+  const scaped = () => isScape(input[i - 1]);
+  const isTemplateStart = c => c === '<' && input[i + 1] === '>';
+  const isTemplateEnd = str => str.endsWith('</>');
 
   const tokens = [];
   let c;
   let i = 0;
+  let functionDepth = 0;
 
-  const advance = () => (c = input[++i]);
+  const advance = n => {
+    i += 1;
+    c = input[i];
+    return c;
+  };
+
+  function getStringToken() {
+    let str = '';
+    do {
+      str += c;
+    } while (isString(advance()));
+    return str;
+  }
+
+  function getFunctionIdentifier() {
+    let idn = '';
+    do {
+      idn += c;
+    } while (isString(advance()) && c !== '(');
+    return idn;
+  }
 
   const addToken = (type, value = c) => tokens.push({ type, value });
 
@@ -987,10 +1028,14 @@ function lex(input) {
       do {
         whitespace += c;
       } while (isWhiteSpace(advance()));
-
       addToken('whitespace', whitespace);
     } else if (isOperator(c)) {
-      addToken('operator', c);
+      if (scaped() || functionDepth === 0) {
+        addToken('string', getStringToken());
+      } else {
+        if (c === ')') functionDepth--;
+        addToken('operator', c);
+      }
       advance();
     } else if (isDigit(c)) {
       let num = c;
@@ -999,37 +1044,34 @@ function lex(input) {
         do num += c;
         while (isDigit(advance()));
       }
-
       addToken('number', num);
     } else if (isIdentifier(c)) {
-      let idn = c;
-      while (isString(advance())) idn += c;
-      if (isFunction(idn)) {
-        addToken('identifier', idn);
+      if (scaped()) {
+        addToken('string', getStringToken());
       } else {
-        addToken('string', idn);
+        const idn = getFunctionIdentifier();
+        if (isFunction(idn)) {
+          functionDepth++;
+          addToken('identifier', idn);
+        } else {
+          addToken('string', idn);
+        }
       }
-    } else if (isString(c)) {
+    } else if (isString(c) || isScape(c)) {
+      addToken('string', getStringToken());
+    } else if (isTemplateStart(c)) {
       let str = '';
       do {
         str += c;
-      } while (
-        isString(advance()) ||
-        (c !== undefined &&
-          (str === "'" ||
-            (str.startsWith("'") && !str.endsWith("'")) ||
-            str === '"' ||
-            (str.startsWith('"') && !str.endsWith('"'))))
-      );
-
-      addToken('string', str);
+        advance();
+      } while (!isTemplateEnd(str));
+      addToken('template', str);
     } else {
       throw new Error(`Lexer: Unrecognized character '${c}' at position ${i} in '${input}'`);
     }
   }
 
   if (!input.length) {
-    // For empty string
     addToken('string', '');
   }
   addToken('(end)');
@@ -1077,7 +1119,7 @@ function parse(tokens) {
 
           if (token().type === 'identifier') {
             args.push(parseIdentifier(token()));
-          } else if (token().type === 'number' || token().type === 'string') {
+          } else if (token().type === 'number' || token().type === 'string' || token().type === 'template') {
             args.push(token());
             advance();
           } else {
@@ -1135,7 +1177,7 @@ async function evaluate(parseTree, values) {
   let args = {};
 
   const parseNode = async node => {
-    if (node.type === 'number' || node.type === 'string' || node.type === 'whitespace') {
+    if (node.type === 'number' || node.type === 'string' || node.type === 'template' || node.type === 'whitespace') {
       return node.value;
     } else if (node.type === 'identifier') {
       const value = args.hasOwnProperty(node.value) ? args[node.value] : variables[node.value];
